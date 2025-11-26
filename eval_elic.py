@@ -16,6 +16,16 @@ warnings.filterwarnings("ignore")
 
 print(torch.cuda.is_available())
 
+#numerical stability
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+#set seeds
+torch.manual_seed(0)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(0)
+
+
 
 def compute_psnr(a, b):
     mse = torch.mean((a - b)**2).item()
@@ -131,11 +141,39 @@ def main(argv):
                 print(f'Encoding {img_name} finished.')
                 out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
                 print(f'Decoding {img_name} finished.')
+                
+                # ===== 検証: compress の y_hat と decompress の y_hat を比較 =====
+                y_hat_compress = out_enc["y_hat"]
+                y_hat_decompress = out_dec["y_hat"]
+                diff = (y_hat_compress - y_hat_decompress).abs()
+                print(f'[Verify y_hat] Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}, Non-zero count: {(diff > 0).sum().item()}')
+                
+                # forward との比較
+                out_forward = net.forward(x_padded)
+                y_hat_forward = out_forward["y_hat"]
+                diff_forward_compress = (y_hat_forward - y_hat_compress).abs()
+                diff_forward_decompress = (y_hat_forward - y_hat_decompress).abs()
+                print(f'[Forward vs Compress] Max diff: {diff_forward_compress.max().item():.6f}, Mean diff: {diff_forward_compress.mean().item():.6f}, Non-zero count: {(diff_forward_compress > 0).sum().item()}')
+                print(f'[Forward vs Decompress] Max diff: {diff_forward_decompress.max().item():.6f}, Mean diff: {diff_forward_decompress.mean().item():.6f}, Non-zero count: {(diff_forward_decompress > 0).sum().item()}')
+                
+                # x_hat の比較 (forward vs decompress)
+                out_forward["x_hat"].clamp_(0, 1)
+                out_forward["x_hat"] = crop(out_forward["x_hat"], padding)
+                x_hat_diff = (out_forward["x_hat"] - crop(out_dec["x_hat"].clone(), (0,0,0,0))).abs()
+                # Note: out_dec["x_hat"] is already cropped below, so compare before crop
+                # ===== 検証終了 =====
+                
                 if args.cuda:
                     torch.cuda.synchronize()
                 e = time.time()
                 total_time += (e - s)
                 out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
+                
+                # x_hat の最終比較
+                x_hat_diff_final = (out_forward["x_hat"] - out_dec["x_hat"]).abs()
+                print(f'[x_hat: Forward vs Decompress] Max diff: {x_hat_diff_final.max().item():.6f}, Mean diff: {x_hat_diff_final.mean().item():.6f}')
+                print(f'[PSNR Forward]: {compute_psnr(x, out_forward["x_hat"]):.2f}dB')
+                
                 num_pixels = x.size(0) * x.size(2) * x.size(3)
                 print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
                 print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')

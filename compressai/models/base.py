@@ -197,6 +197,7 @@ class SimpleVAECompressionModel(CompressionModel):
         return {
             "x_hat": x_hat,
             "likelihoods": y_out["likelihoods"],
+            "y_hat": y_hat,
         }
 
     def compress(self, x):
@@ -210,4 +211,5 @@ class SimpleVAECompressionModel(CompressionModel):
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         return {
             "x_hat": x_hat,
+            "y_hat": y_hat,
         }
