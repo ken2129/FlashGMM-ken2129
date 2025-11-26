@@ -903,8 +903,9 @@ class GaussianMixtureConditional(GaussianConditional):
         symbols = symbols.reshape(scales_.size(0), -1, scales_.size(2), scales_.size(3))
 
         y_hat = torch.zeros(
-            scales_.size(0), zero_bitmap.size(0), scales_.size(2), scales_.size(3)
+            scales_.size(0), zero_bitmap.size(0), scales_.size(2), scales_.size(3),
+            device=scales_.device, dtype=scales_.dtype
         )
-        y_hat[:, nonzero] = symbols.float()
+        y_hat[:, nonzero] = symbols.float().to(scales_.device)
 
         return y_hat
