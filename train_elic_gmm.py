@@ -10,37 +10,45 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 import glob
+import wandb
 
 from compressai.models.elic_gmm import Elic2022GMM
-from torch.utils.tensorboard import SummaryWriter   
+from torch.utils.tensorboard import SummaryWriter
 import os
 import torch.nn.functional as F
 import gc
-#from calflops import calculate_flops
+from calflops import calculate_flops
 
-#torch.backends.cudnn.deterministic=True
-torch.backends.cudnn.benchmark=True
-#torch.backends.cudnn.enabled = False
-torch.set_float32_matmul_precision('high') 
+# torch.backends.cudnn.deterministic=True
+torch.backends.cudnn.benchmark = True
+# torch.backends.cudnn.enabled = False
+
+
 def compute_psnr(a, b):
-    mse = torch.mean((a - b)**2).item()
+    mse = torch.mean((a - b) ** 2).item()
     return -10 * math.log10(mse)
 
+
 def compute_msssim(a, b):
-    return -10 * math.log10(1-ms_ssim(a, b, data_range=1.).item())
+    return -10 * math.log10(1 - ms_ssim(a, b, data_range=1.0).item())
+
 
 def compute_bpp(out_net):
-    size = out_net['x_hat'].size()
+    size = out_net["x_hat"].size()
     num_pixels = size[0] * size[2] * size[3]
-    return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
-              for likelihoods in out_net['likelihoods'].values()).item()
+    return sum(
+        torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+        for likelihoods in out_net["likelihoods"].values()
+    ).item()
+
+
 def pad(x, p):
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -57,20 +65,23 @@ def pad(x, p):
     )
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 
+
 def crop(x, padding):
     return F.pad(
         x,
         (-padding[0], -padding[1], -padding[2], -padding[3]),
     )
+
+
 def test_kodak(kodak_path, net_, args):
-    #collect images under kodak_path
+    # collect images under kodak_path
     p = 128
     count = 0
     PSNR = 0
     Bit_rate = 0
     MS_SSIM = 0
     total_time = 0
-    device =  next(net_.parameters()).device
+    device = next(net_.parameters()).device
     img_list = []
     for file in os.listdir(kodak_path):
         if file[-3:] in ["jpg", "png", "peg"]:
@@ -78,7 +89,7 @@ def test_kodak(kodak_path, net_, args):
     net = net_.eval()
     for img_name in img_list:
         img_path = os.path.join(kodak_path, img_name)
-        img = Image.open(img_path).convert('RGB')
+        img = Image.open(img_path).convert("RGB")
         x = transforms.ToTensor()(img).unsqueeze(0).to(device)
         x_padded, padding = pad(x, p)
         count += 1
@@ -90,12 +101,12 @@ def test_kodak(kodak_path, net_, args):
             if args.cuda:
                 torch.cuda.synchronize()
             e = time.time()
-            total_time += (e - s)
-            out_net['x_hat'].clamp_(0, 1)
+            total_time += e - s
+            out_net["x_hat"].clamp_(0, 1)
             out_net["x_hat"] = crop(out_net["x_hat"], padding)
             print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
             print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
-            print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
+            print(f"Bit-rate: {compute_bpp(out_net):.3f}bpp")
             PSNR += compute_psnr(x, out_net["x_hat"])
             MS_SSIM += compute_msssim(x, out_net["x_hat"])
             Bit_rate += compute_bpp(out_net)
@@ -105,23 +116,75 @@ def test_kodak(kodak_path, net_, args):
     MS_SSIM = MS_SSIM / count
     Bit_rate = Bit_rate / count
     total_time = total_time
-    print(f'average_PSNR: {PSNR:.2f}dB')
-    print(f'average_MS-SSIM: {MS_SSIM:.4f}')
-    print(f'average_Bit-rate: {Bit_rate:.3f} bpp')
-    print(f'average_time: {total_time:.4f} ms')
-    return {"PSNR": PSNR, 
-            "Bit rate": Bit_rate}
+    print(f"average_PSNR: {PSNR:.2f}dB")
+    print(f"average_MS-SSIM: {MS_SSIM:.4f}")
+    print(f"average_Bit-rate: {Bit_rate:.3f} bpp")
+    print(f"average_time: {total_time:.4f} ms")
+    return {"PSNR": PSNR, "Bit rate": Bit_rate}
+
+def test_kodak_real(kodak_path, net, args):
+    # collect images under kodak_path
+    p = 128
+    count = 0
+    PSNR = 0
+    Bit_rate = 0
+    MS_SSIM = 0
+    total_time = 0
+    device = next(net.parameters()).device
+    img_list = []
+    for file in os.listdir(kodak_path):
+        if file[-3:] in ["jpg", "png", "peg"]:
+            img_list.append(file)
+    net.eval()
+    net.update(force=True)
+    for img_name in img_list:
+        img_path = os.path.join(kodak_path, img_name)
+        img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
+        x = img.unsqueeze(0)
+        x_padded, padding = pad(x, p)
+        count += 1
+        with torch.no_grad():
+            if args.cuda:
+                torch.cuda.synchronize()
+            s = time.time()
+            out_enc = net.compress(x_padded)
+            out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
+            if args.cuda:
+                torch.cuda.synchronize()
+            e = time.time()
+            total_time += (e - s)
+            out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
+            num_pixels = x.size(0) * x.size(2) * x.size(3)
+            print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
+            print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
+            print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
+            Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+            PSNR += compute_psnr(x, out_dec["x_hat"])
+            MS_SSIM += compute_msssim(x, out_dec["x_hat"])
+        del out_enc, out_dec, x, img
+        gc.collect()
+    PSNR = PSNR / count
+    MS_SSIM = MS_SSIM / count
+    Bit_rate = Bit_rate / count
+    total_time = total_time
+    print(f"Real average_PSNR: {PSNR:.2f}dB")
+    print(f"Real average_MS-SSIM: {MS_SSIM:.4f}")
+    print(f"Real average_Bit-rate: {Bit_rate:.3f} bpp")
+    print(f"Real average_time: {total_time:.4f} ms")
+    return {"PSNR": PSNR, "Bit rate": Bit_rate}
 
 def compute_msssim(a, b):
-    return ms_ssim(a, b, data_range=1.)
+    return ms_ssim(a, b, data_range=1.0)
+
+
 class ImageNet(Dataset):
     def __init__(self, root, transform=None):
-        #splitdir = Path(root)
+        # splitdir = Path(root)
 
-        #if not splitdir.is_dir():
+        # if not splitdir.is_dir():
         #    raise RuntimeError(f'Invalid directory "{root}"')
 
-        self.samples = glob.glob(root + '/*/*.JPEG')
+        self.samples = glob.glob(root + "/*/*.JPEG")
 
         self.transform = transform
 
@@ -139,10 +202,12 @@ class ImageNet(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
-    def __init__(self, lmbda=1e-2, type='mse'):
+    def __init__(self, lmbda=1e-2, type="mse"):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
@@ -157,14 +222,19 @@ class RateDistortionLoss(nn.Module):
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"].values()
         )
-        if self.type == 'mse':
+        if self.type == "mse":
             out["mse_loss"] = self.mse(output["x_hat"], target)
-            out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
-            out['psnr'] = -10 * math.log10(out["mse_loss"].item())
-            out["msssim"] = ms_ssim(torch.round(output["x_hat"]*255), torch.round(target*255), data_range=255, size_average=True)
+            out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
+            out["psnr"] = -10 * math.log10(out["mse_loss"].item())
+            out["msssim"] = ms_ssim(
+                torch.round(output["x_hat"] * 255),
+                torch.round(target * 255),
+                data_range=255,
+                size_average=True,
+            )
         else:
-            out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-            out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+            out["ms_ssim_loss"] = compute_msssim(output["x_hat"], target)
+            out["loss"] = self.lmbda * (1 - out["ms_ssim_loss"]) + out["bpp_loss"]
 
         return out
 
@@ -193,13 +263,14 @@ class CustomDataParallel(nn.DataParallel):
             return super().__getattr__(key)
         except AttributeError:
             return getattr(self.module, key)
-        
+
+
 def setup_logger(log_dir):
     log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    log_file_handler = logging.FileHandler(log_dir, encoding='utf-8')
+    log_file_handler = logging.FileHandler(log_dir, encoding="utf-8")
     log_file_handler.setFormatter(log_formatter)
     root_logger.addHandler(log_file_handler)
 
@@ -207,7 +278,7 @@ def setup_logger(log_dir):
     log_stream_handler.setFormatter(log_formatter)
     root_logger.addHandler(log_stream_handler)
 
-    logging.info('Logging file is %s' % log_dir)
+    logging.info("Logging file is %s" % log_dir)
 
 
 def configure_optimizers(net, args):
@@ -245,8 +316,15 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
-):  
+    model,
+    criterion,
+    train_dataloader,
+    optimizer,
+    aux_optimizer,
+    epoch,
+    clip_max_norm,
+    type="mse",
+):
 
     model.train()
     device = next(model.parameters()).device
@@ -274,7 +352,7 @@ def train_one_epoch(
         aux_optimizer.step()
 
         if i % 20 == 0:
-            if type == 'mse':
+            if type == "mse":
                 logging.info(
                     f"Train epoch {epoch}: ["
                     f"{i*len(d)}/{len(train_dataloader.dataset)}"
@@ -298,10 +376,10 @@ def train_one_epoch(
                 )
 
 
-def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
+def test_epoch(epoch, test_dataloader, model, criterion, type="mse"):
     model.eval()
     device = next(model.parameters()).device
-    if type == 'mse':
+    if type == "mse":
         loss = AverageMeter()
         bpp_loss = AverageMeter()
         mse_loss = AverageMeter()
@@ -362,8 +440,10 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
     torch.save(state, save_path + filename + "checkpoint_latest.pth.tar")
-    if epoch % 20 == 0:
-         torch.save(state, save_path + filename + "_" + str(epoch) +"_" +  "checkpoint.pth.tar")
+    if epoch % 10 == 0:
+        torch.save(
+            state, save_path + filename + "_" + str(epoch) + "_" + "checkpoint.pth.tar"
+        )
     if is_best:
         torch.save(state, save_path + filename + "checkpoint_best.pth.tar")
 
@@ -443,29 +523,23 @@ def parse_args(argv):
         help="gradient clipping max norm (default: %(default)s",
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--type", type=str, default='mse', help="loss type", choices=['mse', "ms-ssim"])
+    parser.add_argument(
+        "--type", type=str, default="mse", help="loss type", choices=["mse", "ms-ssim"]
+    )
     parser.add_argument("--save_path", type=str, help="save_path")
+    parser.add_argument("--skip_epoch", type=int, default=0)
     parser.add_argument(
-        "--skip_epoch", type=int, default=0
+        "--N",
+        type=int,
+        default=128,
     )
-    parser.add_argument(
-        "--N", type=int, default=128,
-    )
-    parser.add_argument(
-        "--K", type=int, default=4
-    )
-    parser.add_argument(
-        "--lr_epoch", nargs='+', type=int
-    )
-    parser.add_argument(
-        "--continue_train", action="store_true", default=False
-    )
-    parser.add_argument(
-        "--kodak_path" , type=str, default=None 
-    )
-    parser.add_argument(
-        "--gamma", type=float, default=0.1
-    )
+    parser.add_argument("--K", default = 4, type = int)
+    parser.add_argument("--lr_epoch", nargs="+", type=int)
+    parser.add_argument("--continue_train", action="store_true", default=False)
+    parser.add_argument("--kodak_path", type=str, default=None)
+    parser.add_argument("--gamma", type=float, default=0.1)
+    parser.add_argument("--wandb_experiment_name", type=str, default=None)
+    parser.add_argument("--run_id", type=str, default=None)
     args = parser.parse_args(argv)
     return args
 
@@ -479,27 +553,34 @@ def main(argv):
     if not os.path.exists(save_path):
         os.makedirs(save_path)
         os.makedirs(save_path + "tensorboard/")
-    setup_logger(save_path + '/' + time.strftime('%Y%m%d_%H%M%S') + '.log')
+    setup_logger(save_path + "/" + time.strftime("%Y%m%d_%H%M%S") + ".log")
+    if args.wandb_experiment_name is not None:
+        wandb.login(key=os.environ["WANDB_API"])
+        if args.run_id is not None:
+            wandb.init(entity = "tokkiwa-waseda-university",
+                         project = "LIC", group = args.wandb_experiment_name, name = str(args.lmbda), id=args.run_id, resume="must")
+        else:
+            wandb.init(entity = "tokkiwa-waseda-university",
+                         project = "LIC", group = args.wandb_experiment_name, name = str(args.lmbda))
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
     writer = SummaryWriter(save_path + "tensorboard/")
     for k in args.__dict__:
-        logging.info(k + ':' + str(args.__dict__[k]))
+        logging.info(k + ":" + str(args.__dict__[k]))
 
     train_transforms = transforms.Compose(
-       [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
+        [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
     )
 
     test_transforms = transforms.Compose(
-         [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
+        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
     )
-
 
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
-    #train_dataset = ImageNet(args.dataset + "/train.X[1-4]", transform=train_transforms)
-    #test_dataset = ImageNet(args.dataset +"/val.X" , transform=test_transforms)
+    # train_dataset = ImageNet(args.dataset + "/train.X[1-4]", transform=train_transforms)
+    # test_dataset = ImageNet(args.dataset +"/val.X" , transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(device)
@@ -510,7 +591,6 @@ def main(argv):
         num_workers=args.num_workers,
         shuffle=True,
         pin_memory=(device == "cuda"),
-        
     )
 
     test_dataloader = DataLoader(
@@ -520,22 +600,25 @@ def main(argv):
         shuffle=False,
         pin_memory=(device == "cuda"),
     )
-
-    net = Elic2022GMM(N=args.N, K = args.K, quantizer = "noise")
-    #net = Cheng2020AnchorCheckerboard(N = args.N)
+    net = Elic2022GMM(
+        N=args.N, K = args.K, quantizer = "weighted_mean_ste")
     net = net.to(device)
-    #net = torch.compile(net, dynamic=True)
-    #print(calculate_flops(net, (1, 3, 768, 512)))
-    
+    # net.update()
 
+    with torch.no_grad():
+        print(
+            "MODEL COMPUTATION SIZE FOR KODAK", calculate_flops(net, (1, 3, 512, 768))
+        )
 
-    #if args.cuda and torch.cuda.device_count() > 1:
+    # if args.cuda and torch.cuda.device_count() > 1:
     #    net = CustomDataParallel(net)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     milestones = args.lr_epoch
     print("milestones: ", milestones)
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=args.gamma, last_epoch=-1)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones, gamma=args.gamma, last_epoch=-1
+    )
 
     criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
 
@@ -543,8 +626,9 @@ def main(argv):
     if args.checkpoint:  # load from previous checkpoint
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location="cuda")
-        #checkpointをGPUに読み込むとCUDA OUT OF MEMORYになるので、CPUに読み込んでからGPUに転送
+        # checkpointをGPUに読み込むとCUDA OUT OF MEMORYになるので、CPUに読み込んでからGPUに転送
         net.load_state_dict(checkpoint["state_dict"])
+        
         if args.continue_train:
             last_epoch = checkpoint["epoch"] + 1
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -554,11 +638,12 @@ def main(argv):
     if args.kodak_path is not None:
         print("kodak test mode enabled, testing...")
         print(test_kodak(args.kodak_path, net, args))
-        
+        print(test_kodak_real(args.kodak_path, net, args))
+
     best_loss = float("inf")
     for epoch in tqdm(range(last_epoch, args.epochs)):
         # print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        logging.info('======Current epoch %s ======'%epoch)
+        logging.info("======Current epoch %s ======" % epoch)
         logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
         train_one_epoch(
             net,
@@ -568,13 +653,29 @@ def main(argv):
             aux_optimizer,
             epoch,
             args.clip_max_norm,
-            type
+            type,
         )
         loss = test_epoch(epoch, test_dataloader, net, criterion, type)
-        writer.add_scalar('test_loss', loss, epoch)
+        writer.add_scalar("test_loss", loss, epoch)
+
+        if args.wandb_experiment_name is not None:
+            wandb.log({"test_loss": loss})
+
         if args.kodak_path is not None:
             kodak_rd = test_kodak(args.kodak_path, net, args)
-            writer.add_scalars('kodak_RD', kodak_rd, epoch)
+            writer.add_scalars("Forward_kodak_RD", kodak_rd, epoch)
+
+            real_kodak_rd = test_kodak_real(args.kodak_path, net, args)
+            writer.add_scalars("real_kodak_RD", real_kodak_rd, epoch)
+            if args.wandb_experiment_name is not None:
+                wandb.log(
+                    {
+                        "Forward_kodak_PSNR": kodak_rd["PSNR"],
+                        "Forward_kodak_Bit rate": kodak_rd["Bit rate"],
+                        "Real_kodak_PSNR": real_kodak_rd["PSNR"],
+                        "Real_kodak_Bit rate": real_kodak_rd["Bit rate"],
+                    }
+                )
         lr_scheduler.step()
 
         is_best = loss < best_loss

@@ -96,7 +96,7 @@ def main(argv):
     else:
         device = 'cpu'
 
-    net = Elic2022GMM(N=args.N, K=args.K)
+    net = Elic2022GMM(N=args.N, K=args.K, quantizer="weighted_mean_ste")
     net = net.to(device)
     net.eval()
     count = 0
