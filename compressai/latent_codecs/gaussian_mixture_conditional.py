@@ -132,27 +132,31 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         gaussian_params = self.entropy_parameters(ctx_params)
         scales_hat, means_hat, weights = self._chunk(gaussian_params)
         weights = self._reshape_gmm_weight(weights)
-        #indexes = self.gaussian_conditional.build_indexes(scales_hat)
         start_time = time.time()
         
-        # Both "noise" and "weighted_mean_ste" quantizers use weighted mean for compress
-        # to be consistent with forward (which uses weighted_mean in checkerboard twopass)
-        B, KC, H, W = means_hat.shape
-        C = KC // self.K
-        means_hat_expanded = means_hat.view(B, self.K, C, H, W)
-        weights_expanded = weights.view(B, self.K, C, H, W)
-        weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-        
-        # Shift y and means by weighted_sum to compress residuals
-        y_residual = y - weighted_sum
-        means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
-        means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
-        
-        y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
-            y_residual, scales_hat, means_hat_shifted, weights
-        )
-        # Add back weighted_sum to get final y_hat
-        y_hat = y_hat_residual + weighted_sum
+        if self.quantizer == "noise":
+            # Simple round quantization (for onepass training)
+            y_strings, y_hat = self.gaussian_mixture_conditional.compress(
+                y, scales_hat, means_hat, weights
+            )
+        elif self.quantizer == "weighted_mean_ste":
+            # Use weighted mean for compress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
+            
+            # Shift y and means by weighted_sum to compress residuals
+            y_residual = y - weighted_sum
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
+                y_residual, scales_hat, means_hat_shifted, weights
+            )
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
         
         print(f"time taken to GMM compression: {time.time() - start_time}" )
         return {"strings": [y_strings], "shape": y.shape[2:4], "y_hat": y_hat}
@@ -169,25 +173,32 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         scales_hat, means_hat, weights = self._chunk(gaussian_params)
         weights = self._reshape_gmm_weight(weights)
         
-        # Both "noise" and "weighted_mean_ste" quantizers use weighted mean for decompress
-        # to be consistent with forward (which uses weighted_mean in checkerboard twopass)
-        B, KC, H, W = means_hat.shape
-        C = KC // self.K
-        means_hat_expanded = means_hat.view(B, self.K, C, H, W)
-        weights_expanded = weights.view(B, self.K, C, H, W)
-        weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-        
-        # Shift means by weighted_sum (same as compress)
-        means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
-        means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
-        
         start_time = time.time()
-        y_hat_residual = self.gaussian_mixture_conditional.decompress(
-            *y_strings, scales_hat, means_hat_shifted, weights
-        )
+        
+        if self.quantizer == "noise":
+            # Simple round quantization (for onepass training)
+            y_hat = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat, weights
+            )
+        elif self.quantizer == "weighted_mean_ste":
+            # Use weighted mean for decompress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
+            
+            # Shift means by weighted_sum (same as compress)
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_hat_residual = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat_shifted, weights
+            )
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
+        
         print(f"time taken to GMM decompression: {time.time() - start_time}" )
-        # Add back weighted_sum to get final y_hat
-        y_hat = y_hat_residual + weighted_sum
         
         assert y_hat.shape[2:4] == shape
         return {"y_hat": y_hat}
