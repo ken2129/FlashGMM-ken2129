@@ -121,6 +121,7 @@ class CheckerboardLatentCodec(LatentCodec):
         context_prediction: Optional[nn.Module] = None,
         anchor_parity="even",
         forward_method="twopass",
+        gmm_k: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -128,6 +129,7 @@ class CheckerboardLatentCodec(LatentCodec):
         self.anchor_parity = anchor_parity
         self.non_anchor_parity = {"odd": "even", "even": "odd"}[anchor_parity]
         self.forward_method = forward_method
+        self.gmm_k = gmm_k
         self.entropy_parameters = entropy_parameters or nn.Identity()
         self.context_prediction = context_prediction or nn.Identity()
         self._set_group_defaults(
@@ -186,7 +188,10 @@ class CheckerboardLatentCodec(LatentCodec):
         """
         B, C, H, W = y.shape
 
-        params = y.new_zeros((B, C * 2, H, W))
+        if self.gmm_k is not None and self.gmm_k >= 1:
+            params = y.new_zeros((B, C * 3 * self.gmm_k, H, W))
+        else:
+            params = y.new_zeros((B, C * 2, H, W))
 
         y_hat_anchors = self._forward_twopass_step(
             y, side_params, params, self._y_ctx_zero(y), "anchor"
@@ -208,7 +213,7 @@ class CheckerboardLatentCodec(LatentCodec):
 
     def _forward_twopass_step(
         self, y: Tensor, side_params: Tensor, params: Tensor, y_ctx: Tensor, step: str
-    ) -> Dict[str, Any]:
+    ) -> Tensor:
         # NOTE: The _i variables contain only the current step's pixels.
         assert step in ("anchor", "non_anchor")
 
@@ -227,8 +232,24 @@ class CheckerboardLatentCodec(LatentCodec):
         y_i = self._keep_only(y, step)
 
         # Determine y_hat for current step, and mask out the other pixels.
-        _, means_i = self.latent_codec["y"]._chunk(params_i)
-        y_hat_i = self._keep_only(quantize_ste(y_i - means_i) + means_i, step)
+        chunk_result = self.latent_codec["y"]._chunk(params_i)
+        if len(chunk_result) == 3:
+            # GMM: scales, means, weights
+            scales_i, means_i, weights_i = chunk_result
+            # Reshape and compute weighted mean
+            K = self.gmm_k
+            B, KC, H, W = means_i.shape
+            C = KC // K
+            # Apply softmax to weights (same as _reshape_gmm_weight)
+            weights_i = weights_i.view(B, K, C, H, W)
+            weights_i = torch.nn.functional.softmax(weights_i, dim=1)
+            means_i_expanded = means_i.view(B, K, C, H, W)
+            weighted_mean = torch.sum(means_i_expanded * weights_i, dim=1)  # (B, C, H, W)
+            y_hat_i = self._keep_only(quantize_ste(y_i - weighted_mean) + weighted_mean, step)
+        else:
+            # Gaussian: scales, means
+            _, means_i = chunk_result
+            y_hat_i = self._keep_only(quantize_ste(y_i - means_i) + means_i, step)
 
         return y_hat_i
 

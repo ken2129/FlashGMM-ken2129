@@ -81,7 +81,7 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         gaussian_mixture_conditional: Optional[GaussianMixtureConditional] = None,
         entropy_parameters: Optional[nn.Module] = None,
         quantizer: str = "noise",
-        chunks: Tuple[str] = ("scales", "means", "weights"),
+        chunks: Tuple[str, ...] = ("scales", "means", "weights"),
         **kwargs,
     ):
         super().__init__()
@@ -110,17 +110,21 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             # means_hat and weights here is the shape "B x (K x C) x H x W"
             # decompose them to "B x K x C x H x W", multiply them and get summation along K
             # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
-            weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            y_hat = quantize_ste(y - weighted_sum) + weighted_sum
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_hat, y_likelihoods = self.gaussian_mixture_conditional(y_hat,
-                                                                scales_hat, 
-                                                                means_hat, 
-                                                                weights
-                                                                )
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            weighted_mean = torch.sum(means_hat_expanded * weights_expanded, dim=1)  # (B, C, H, W)
+            
+            # Quantize using weighted mean (STE)
+            y_hat = quantize_ste(y - weighted_mean) + weighted_mean
+            
+            # Compute likelihood using the original GMM parameters (not modified)
+            y_likelihoods = self.gaussian_mixture_conditional._likelihood(
+                y_hat, scales_hat, means_hat, weights
+            )
+            if self.gaussian_mixture_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
             
         return {"likelihoods": {"y": y_likelihoods}, "y_hat": y_hat}
 
@@ -136,13 +140,22 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             # means_hat and weights here is the shape "B x (K x C) x H x W"
             # decompose them to "B x K x C x H x W", multiply them and get summation along K
             # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
             weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            y_hat = quantize_ste(y - weighted_sum)
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_strings, y_hat = self.gaussian_mixture_conditional.compress(y_hat, scales_hat, means_hat, weights)
+            
+            # Shift y and means by weighted_sum to compress residuals
+            y_residual = y - weighted_sum
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
+                y_residual, scales_hat, means_hat_shifted, weights
+            )
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
         print(f"time taken to GMM compression: {time.time() - start_time}" )
         return {"strings": [y_strings], "shape": y.shape[2:4], "y_hat": y_hat}
 
@@ -168,15 +181,23 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             # means_hat and weights here is the shape "B x (K x C) x H x W"
             # decompose them to "B x K x C x H x W", multiply them and get summation along K
             # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
             weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_hat = self.gaussian_mixture_conditional.decompress(
-                *y_strings, scales_hat, means_hat, weights
+            
+            # Shift means by weighted_sum (same as compress)
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            start_time = time.time()
+            y_hat_residual = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat_shifted, weights
             )
-            y_hat = y_hat + weighted_sum
+            print(f"time taken to GMM decompression: {time.time() - start_time}" )
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
         assert y_hat.shape[2:4] == shape
         return {"y_hat": y_hat}
 
