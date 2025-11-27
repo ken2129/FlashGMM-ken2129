@@ -96,12 +96,30 @@ class GaussianConditionalLatentCodec(LatentCodec):
         self.entropy_parameters = entropy_parameters or nn.Identity()
         self.chunks = tuple(chunks)
 
-    def forward(self, y: Tensor, ctx_params: Tensor) -> Dict[str, Any]:
+    def forward(self, y: Tensor, ctx_params: Tensor, y_hat: Tensor = None) -> Dict[str, Any]:
         gaussian_params = self.entropy_parameters(ctx_params)
         scales_hat, means_hat = self._chunk(gaussian_params)
-        y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
-        if self.quantizer == "ste":
+        
+        # If y_hat is provided (e.g., from checkerboard twopass), use it directly
+        if y_hat is not None:
+            # Just compute likelihood with the provided y_hat
+            y_likelihoods = self.gaussian_conditional._likelihood(
+                y_hat, scales_hat, means=means_hat
+            )
+            if self.gaussian_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_conditional.likelihood_lower_bound(y_likelihoods)
+        elif self.quantizer == "ste":
+            # Compute y_hat first, then likelihood
             y_hat = quantize_ste(y - means_hat) + means_hat
+            y_likelihoods = self.gaussian_conditional._likelihood(
+                y_hat, scales_hat, means=means_hat
+            )
+            if self.gaussian_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_conditional.likelihood_lower_bound(y_likelihoods)
+        else:
+            # Default: use gaussian_conditional's forward (noise quantization)
+            y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
+        
         return {"likelihoods": {"y": y_likelihoods}, "y_hat": y_hat}
 
     def compress(self, y: Tensor, ctx_params: Tensor) -> Dict[str, Any]:
