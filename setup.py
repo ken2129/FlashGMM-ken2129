@@ -74,6 +74,9 @@ def get_extensions():
         extra_compile_args += ["-O0", "-g", "-UNDEBUG"]
     else:
         extra_compile_args += ["-O3"]
+    
+    # Force Pre-CXX11 ABI to match PyTorch in container
+    extra_compile_args += ["-D_GLIBCXX_USE_CXX11_ABI=0"]
     ext_modules.append(
         cpp_extension.CppExtension(
             name=f"{package_name}.ans",
