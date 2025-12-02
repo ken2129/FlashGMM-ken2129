@@ -202,7 +202,8 @@ class CheckerboardLatentCodec(LatentCodec):
         )
 
         y_hat = y_hat_anchors + y_hat_non_anchors
-        y_out = self.latent_codec["y"](y, params)
+        # Pass y_hat to latent_codec to compute likelihood with the correct y_hat
+        y_out = self.latent_codec["y"](y, params, y_hat=y_hat)
 
         return {
             "likelihoods": {
