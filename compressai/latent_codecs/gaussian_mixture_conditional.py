@@ -85,7 +85,7 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         **kwargs,
     ):
         super().__init__()
-        assert quantizer in ["noise", "weighted_mean_ste"], f"quantizer {quantizer} not supported"
+        assert quantizer in ["noise", "weighted_mean_ste", "dominant_mean_ste"], f"quantizer {quantizer} not supported"
         self.K = K
         self.quantizer = quantizer
         self.gaussian_mixture_conditional = gaussian_mixture_conditional if gaussian_mixture_conditional is not None else GaussianMixtureConditional(
@@ -134,6 +134,31 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             )
             if self.gaussian_mixture_conditional.use_likelihood_bound:
                 y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # means_hat and weights here is the shape "B x (K x C) x H x W"
+            # decompose them to "B x K x C x H x W", find argmax of weights along K
+            # to get the dominant mean of shape "B x C x H x W"
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight) for each spatial location
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            
+            # Gather the dominant mean using the index
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Quantize using dominant mean (STE)
+            y_hat = quantize_ste(y - dominant_mean) + dominant_mean
+            
+            # Compute likelihood using the original GMM parameters (not modified)
+            y_likelihoods = self.gaussian_mixture_conditional._likelihood(
+                y_hat, scales_hat, means_hat, weights
+            )
+            if self.gaussian_mixture_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
             
         return {"likelihoods": {"y": y_likelihoods}, "y_hat": y_hat}
 
@@ -166,6 +191,28 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             )
             # Add back weighted_sum to get final y_hat
             y_hat = y_hat_residual + weighted_sum
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # Use dominant mean for compress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight)
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Shift y and means by dominant_mean to compress residuals
+            y_residual = y - dominant_mean
+            means_hat_shifted = means_hat_expanded - dominant_mean.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
+                y_residual, scales_hat, means_hat_shifted, weights
+            )
+            # Add back dominant_mean to get final y_hat
+            y_hat = y_hat_residual + dominant_mean
         
         print(f"time taken to GMM compression: {time.time() - start_time}" )
         return {"strings": [y_strings], "shape": y.shape[2:4], "y_hat": y_hat}
@@ -206,6 +253,27 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             )
             # Add back weighted_sum to get final y_hat
             y_hat = y_hat_residual + weighted_sum
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # Use dominant mean for decompress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight)
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Shift means by dominant_mean (same as compress)
+            means_hat_shifted = means_hat_expanded - dominant_mean.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_hat_residual = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat_shifted, weights
+            )
+            # Add back dominant_mean to get final y_hat
+            y_hat = y_hat_residual + dominant_mean
         
         print(f"time taken to GMM decompression: {time.time() - start_time}" )
         
