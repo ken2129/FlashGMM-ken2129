@@ -955,6 +955,106 @@ RansDecoder::decode_stream(const std::vector<int32_t> &indexes,
   return output;
 }
 
+template<int K> 
+torch::Tensor RansDecoder::decode_stream_gmm(
+                                 const torch::Tensor &scales,
+                                 const torch::Tensor &means,
+                                 const torch::Tensor &weights,
+                                 const int32_t max_bs_value) {
+  const int64_t num_symbols = scales.size(0);
+  auto output = torch::empty({num_symbols}, torch::kInt32);
+  auto output_ptr = output.data_ptr<int32_t>();
+
+  auto scales_acc = scales.accessor<float, 2>();
+  auto means_acc = means.accessor<float, 2>();
+  auto weights_acc = weights.accessor<float, 2>();
+
+  std::array<float, K> current_means_arr;
+  std::array<float, K> current_scales_arr;
+  std::array<float, K> current_weights_arr;
+
+  assert(_ptr != nullptr); // Ensure set_stream was called
+
+  for (int64_t i = 0; i < num_symbols; ++i) {
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+        current_means_arr[k_idx] = means_acc[i][k_idx];
+        current_scales_arr[k_idx] = scales_acc[i][k_idx];
+        current_weights_arr[k_idx] = weights_acc[i][k_idx];
+    }
+
+    const uint32_t cum_freq = Rans64DecGet(&_rans, precision);
+    int32_t value;
+
+    if(cum_freq == max_cdf_value) { // Bypass marker
+      Rans64DecAdvance(&_rans, &_ptr, max_cdf_value, 1, precision);
+      int32_t val_bypass = Rans64DecGetBits(&_rans, &_ptr, bypass_precision);
+      int32_t n_bypass = val_bypass;
+
+      while (val_bypass == max_bypass_val) {
+        val_bypass = Rans64DecGetBits(&_rans, &_ptr, bypass_precision);
+        n_bypass += val_bypass;
+      }
+
+      uint32_t raw_val = 0;
+      for (int j = 0; j < n_bypass; ++j) {
+        val_bypass = Rans64DecGetBits(&_rans, &_ptr, bypass_precision);
+        assert(val_bypass <= max_bypass_val);
+        raw_val |= val_bypass << (j * bypass_precision);
+      }
+      value = reinterpret_cast<int32_t&>(raw_val);
+    } else {
+      int32_t s_bs = -max_bs_value;
+      int32_t e_bs = max_bs_value;
+      int32_t mid = 0;
+      uint16_t mid_val_1_cdf = 0;
+      uint16_t mid_val_2_cdf = 0;
+      
+      // Binary search for the symbol
+      while (s_bs <= e_bs){
+        mid = s_bs + (e_bs - s_bs) / 2;
+        float cdf1_float, cdf2_float;
+        std::tie(cdf1_float, cdf2_float) = _fast_gmm_cdf<K>(
+          static_cast<float>(mid) - offset, static_cast<float>(mid) - offset + 1.0f,
+          current_means_arr, current_scales_arr, current_weights_arr
+        );
+
+        mid_val_1_cdf = static_cast<uint16_t>(cdf1_float * max_cdf_value);
+        mid_val_2_cdf = static_cast<uint16_t>(cdf2_float * max_cdf_value);
+        
+        if (mid_val_1_cdf <= cum_freq && mid_val_2_cdf > cum_freq) {
+            break; // Found the symbol
+        } else if (mid_val_1_cdf > cum_freq) {
+            e_bs = mid - 1;
+        } else { 
+            s_bs = mid + 1;
+        }
+      }
+      // Ensure cdf values correspond to the final 'mid' after loop
+      float final_cdf1_float, final_cdf2_float;
+      std::tie(final_cdf1_float, final_cdf2_float) = _fast_gmm_cdf<K>(
+          static_cast<float>(mid) - offset, static_cast<float>(mid) - offset + 1.0f,
+          current_means_arr, current_scales_arr, current_weights_arr
+      );
+      mid_val_1_cdf = static_cast<uint16_t>(final_cdf1_float * max_cdf_value);
+      mid_val_2_cdf = static_cast<uint16_t>(final_cdf2_float * max_cdf_value);
+
+      uint16_t pmf = mid_val_2_cdf - mid_val_1_cdf;
+      if (pmf == 0) {
+          pmf = 1;
+          if (mid_val_1_cdf + pmf > (1 << precision)) { 
+              mid_val_1_cdf = (1 << precision) - pmf;
+          }
+      }
+
+      Rans64DecAdvance(&_rans, &_ptr, mid_val_1_cdf, pmf, precision);
+      value = static_cast<int32_t>(mid);
+    }
+    output_ptr[i] = value;
+  }
+  return output;
+}
+
+
 // K_gmm_default is already defined above
 // constexpr int K = 4; // Replaced by K_gmm_default for pybind context
 
@@ -1032,5 +1132,14 @@ PYBIND11_MODULE(ans, m) {
                               const int32_t)>(
                 &RansDecoder::decode_with_indexes_gmm<K_gmm_default>), // Use K_gmm_default
             "Decode a string to a tensor of symbols",
-            py::arg("encoded"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"));
+            py::arg("encoded"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"))
+      .def("decode_stream_gmm",
+            static_cast<torch::Tensor (RansDecoder::*) (
+                              const torch::Tensor &,
+                              const torch::Tensor &,
+                              const torch::Tensor &,
+                              const int32_t)>(
+                &RansDecoder::decode_stream_gmm<K_gmm_default>),
+            "Decode stream to a tensor of symbols using GMM",
+            py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"));
 }

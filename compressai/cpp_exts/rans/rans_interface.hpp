@@ -147,6 +147,12 @@ public:
                 const std::vector<int32_t> &cdfs_sizes,
                 const std::vector<int32_t> &offsets);
 
+  template<int K> torch::Tensor
+  decode_stream_gmm(const torch::Tensor &scales,
+                    const torch::Tensor &means,
+                    const torch::Tensor &weights,
+                    const int32_t max_bs_value);
+
 private:
   Rans64State _rans;
   std::string _stream;

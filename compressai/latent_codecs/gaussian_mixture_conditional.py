@@ -81,11 +81,11 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         gaussian_mixture_conditional: Optional[GaussianMixtureConditional] = None,
         entropy_parameters: Optional[nn.Module] = None,
         quantizer: str = "noise",
-        chunks: Tuple[str] = ("scales", "means", "weights"),
+        chunks: Tuple[str, ...] = ("scales", "means", "weights"),
         **kwargs,
     ):
         super().__init__()
-        assert quantizer in ["noise", "weighted_mean_ste"], f"quantizer {quantizer} not supported"
+        assert quantizer in ["noise", "weighted_mean_ste", "dominant_mean_ste"], f"quantizer {quantizer} not supported"
         self.K = K
         self.quantizer = quantizer
         self.gaussian_mixture_conditional = gaussian_mixture_conditional if gaussian_mixture_conditional is not None else GaussianMixtureConditional(
@@ -96,11 +96,20 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         self.entropy_parameters = entropy_parameters or nn.Identity()
         self.chunks = tuple(chunks)
 
-    def forward(self, y: Tensor, ctx_params: Tensor) -> Dict[str, Any]:
+    def forward(self, y: Tensor, ctx_params: Tensor, y_hat: Tensor = None) -> Dict[str, Any]:
         gaussian_params = self.entropy_parameters(ctx_params)
         scales_hat, means_hat, weights = self._chunk(gaussian_params)
         weights = self._reshape_gmm_weight(weights)
-        if self.quantizer == "noise":
+        
+        # If y_hat is provided (e.g., from checkerboard twopass), use it directly
+        if y_hat is not None:
+            # Just compute likelihood with the provided y_hat
+            y_likelihoods = self.gaussian_mixture_conditional._likelihood(
+                y_hat, scales_hat, means_hat, weights
+            )
+            if self.gaussian_mixture_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
+        elif self.quantizer == "noise":
             y_hat, y_likelihoods = self.gaussian_mixture_conditional(y, 
                                                                     scales_hat, 
                                                                     means_hat, 
@@ -110,17 +119,46 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
             # means_hat and weights here is the shape "B x (K x C) x H x W"
             # decompose them to "B x K x C x H x W", multiply them and get summation along K
             # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
-            weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            y_hat = quantize_ste(y - weighted_sum) + weighted_sum
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_hat, y_likelihoods = self.gaussian_mixture_conditional(y_hat,
-                                                                scales_hat, 
-                                                                means_hat, 
-                                                                weights
-                                                                )
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            weighted_mean = torch.sum(means_hat_expanded * weights_expanded, dim=1)  # (B, C, H, W)
+            
+            # Quantize using weighted mean (STE)
+            y_hat = quantize_ste(y - weighted_mean) + weighted_mean
+            
+            # Compute likelihood using the original GMM parameters (not modified)
+            y_likelihoods = self.gaussian_mixture_conditional._likelihood(
+                y_hat, scales_hat, means_hat, weights
+            )
+            if self.gaussian_mixture_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # means_hat and weights here is the shape "B x (K x C) x H x W"
+            # decompose them to "B x K x C x H x W", find argmax of weights along K
+            # to get the dominant mean of shape "B x C x H x W"
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight) for each spatial location
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            
+            # Gather the dominant mean using the index
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Quantize using dominant mean (STE)
+            y_hat = quantize_ste(y - dominant_mean) + dominant_mean
+            
+            # Compute likelihood using the original GMM parameters (not modified)
+            y_likelihoods = self.gaussian_mixture_conditional._likelihood(
+                y_hat, scales_hat, means_hat, weights
+            )
+            if self.gaussian_mixture_conditional.use_likelihood_bound:
+                y_likelihoods = self.gaussian_mixture_conditional.likelihood_lower_bound(y_likelihoods)
             
         return {"likelihoods": {"y": y_likelihoods}, "y_hat": y_hat}
 
@@ -128,21 +166,54 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         gaussian_params = self.entropy_parameters(ctx_params)
         scales_hat, means_hat, weights = self._chunk(gaussian_params)
         weights = self._reshape_gmm_weight(weights)
-        #indexes = self.gaussian_conditional.build_indexes(scales_hat)
         start_time = time.time()
+        
         if self.quantizer == "noise":
-            y_strings, y_hat = self.gaussian_mixture_conditional.compress(y, scales_hat, means_hat, weights)
+            # Simple round quantization (for onepass training)
+            y_strings, y_hat = self.gaussian_mixture_conditional.compress(
+                y, scales_hat, means_hat, weights
+            )
         elif self.quantizer == "weighted_mean_ste":
-            # means_hat and weights here is the shape "B x (K x C) x H x W"
-            # decompose them to "B x K x C x H x W", multiply them and get summation along K
-            # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
+            # Use weighted mean for compress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
             weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            y_hat = quantize_ste(y - weighted_sum)
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_strings, y_hat = self.gaussian_mixture_conditional.compress(y_hat, scales_hat, means_hat, weights)
+            
+            # Shift y and means by weighted_sum to compress residuals
+            y_residual = y - weighted_sum
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
+                y_residual, scales_hat, means_hat_shifted, weights
+            )
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # Use dominant mean for compress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight)
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Shift y and means by dominant_mean to compress residuals
+            y_residual = y - dominant_mean
+            means_hat_shifted = means_hat_expanded - dominant_mean.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_strings, y_hat_residual = self.gaussian_mixture_conditional.compress(
+                y_residual, scales_hat, means_hat_shifted, weights
+            )
+            # Add back dominant_mean to get final y_hat
+            y_hat = y_hat_residual + dominant_mean
+        
         print(f"time taken to GMM compression: {time.time() - start_time}" )
         return {"strings": [y_strings], "shape": y.shape[2:4], "y_hat": y_hat}
 
@@ -157,30 +228,59 @@ class GaussianMixtureConditionalLatentCodec(LatentCodec):
         gaussian_params = self.entropy_parameters(ctx_params)
         scales_hat, means_hat, weights = self._chunk(gaussian_params)
         weights = self._reshape_gmm_weight(weights)
-        #indexes = self.gaussian_conditional.build_indexes(scales_hat)
+        
+        start_time = time.time()
+        
         if self.quantizer == "noise":
-            start_time = time.time()
+            # Simple round quantization (for onepass training)
             y_hat = self.gaussian_mixture_conditional.decompress(
                 *y_strings, scales_hat, means_hat, weights
             )
-            print(f"time taken to GMM decompression: {time.time() - start_time}" )
         elif self.quantizer == "weighted_mean_ste":
-            # means_hat and weights here is the shape "B x (K x C) x H x W"
-            # decompose them to "B x K x C x H x W", multiply them and get summation along K
-            # to get the weighted mean of shape "B x C x H x W"
-            means_hat_expanded = means_hat.view(means_hat.size(0), self.K, -1, means_hat.size(2), means_hat.size(3))
-            weights_expanded = weights.view(weights.size(0), self.K, -1, weights.size(2), weights.size(3))
+            # Use weighted mean for decompress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
             weighted_sum = torch.sum(means_hat_expanded * weights_expanded, dim=1)
-            means_hat_expanded = means_hat_expanded - weighted_sum.unsqueeze(1).repeat(1, self.K, 1, 1, 1)
-            means_hat = means_hat_expanded.view(means_hat.size(0), -1, means_hat.size(2), means_hat.size(3))
-            y_hat = self.gaussian_mixture_conditional.decompress(
-                *y_strings, scales_hat, means_hat, weights
+            
+            # Shift means by weighted_sum (same as compress)
+            means_hat_shifted = means_hat_expanded - weighted_sum.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_hat_residual = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat_shifted, weights
             )
-            y_hat = y_hat + weighted_sum
+            # Add back weighted_sum to get final y_hat
+            y_hat = y_hat_residual + weighted_sum
+        
+        elif self.quantizer == "dominant_mean_ste":
+            # Use dominant mean for decompress (for twopass STE training)
+            B, KC, H, W = means_hat.shape
+            C = KC // self.K
+            means_hat_expanded = means_hat.view(B, self.K, C, H, W)
+            weights_expanded = weights.view(B, self.K, C, H, W)
+            
+            # Get the index of the dominant component (highest weight)
+            dominant_idx = torch.argmax(weights_expanded, dim=1, keepdim=True)  # (B, 1, C, H, W)
+            dominant_mean = torch.gather(means_hat_expanded, dim=1, index=dominant_idx).squeeze(1)  # (B, C, H, W)
+            
+            # Shift means by dominant_mean (same as compress)
+            means_hat_shifted = means_hat_expanded - dominant_mean.unsqueeze(1)
+            means_hat_shifted = means_hat_shifted.view(B, KC, H, W)
+            
+            y_hat_residual = self.gaussian_mixture_conditional.decompress(
+                *y_strings, scales_hat, means_hat_shifted, weights
+            )
+            # Add back dominant_mean to get final y_hat
+            y_hat = y_hat_residual + dominant_mean
+        
+        print(f"time taken to GMM decompression: {time.time() - start_time}" )
+        
         assert y_hat.shape[2:4] == shape
         return {"y_hat": y_hat}
 
-    def _chunk(self, params: Tensor) -> Tuple[Tensor, Tensor]:
+    def _chunk(self, params: Tensor):
         scales, means = None, None
         if self.chunks == ("scales",):
             scales = params

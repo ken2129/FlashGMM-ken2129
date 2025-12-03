@@ -903,8 +903,54 @@ class GaussianMixtureConditional(GaussianConditional):
         symbols = symbols.reshape(scales_.size(0), -1, scales_.size(2), scales_.size(3))
 
         y_hat = torch.zeros(
-            scales_.size(0), zero_bitmap.size(0), scales_.size(2), scales_.size(3)
+            scales_.size(0), zero_bitmap.size(0), scales_.size(2), scales_.size(3),
+            device=scales_.device, dtype=scales_.dtype
         )
-        y_hat[:, nonzero] = symbols.float()
+        y_hat[:, nonzero] = symbols.float().to(scales_.device)
 
         return y_hat
+
+    def _reshape_gmm(self, params: Tensor) -> Tensor:
+        """Reshape parameters from (B, M*K, H, W) to (B, K, M, H, W) for GMM processing.
+        
+        Args:
+            params: Tensor of shape (B, M*K, H, W) where M is number of channels and K is GMM components.
+            
+        Returns:
+            Tensor of shape (B, K, M, H, W).
+        """
+        B, MK, H, W = params.shape
+        M = MK // self.K
+        return params.view(B, self.K, M, H, W)
+
+    def _reshape_gmm_weight(self, weight: Tensor) -> Tensor:
+        """Reshape and apply softmax to GMM weights.
+        
+        Args:
+            weight: Tensor of shape (B, M, H, W) or raw weight tensor.
+            
+        Returns:
+            Tensor with softmax applied along the K dimension, shape (B, M*K, H, W).
+        """
+        B, MK, H, W = weight.shape
+        M = MK // self.K
+        # Reshape to (B, K, M, H, W) for softmax across K components
+        weight = weight.view(B, self.K, M, H, W)
+        weight = torch.nn.functional.softmax(weight, dim=1)
+        # Reshape back to (B, K*M, H, W)
+        weight = weight.view(B, self.K * M, H, W)
+        return weight
+
+    def dequantize(self, symbols: Tensor, means: Optional[Tensor] = None) -> Tensor:
+        """Dequantize symbols by adding means.
+        
+        Args:
+            symbols: Quantized symbols tensor.
+            means: Optional means tensor to add.
+            
+        Returns:
+            Dequantized tensor.
+        """
+        if means is not None:
+            return symbols.float() + means
+        return symbols.float()

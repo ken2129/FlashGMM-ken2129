@@ -202,7 +202,8 @@ class Elic2022GMM(SimpleVAECompressionModel):
                 },
                 context_prediction=spatial_context[t],
                 entropy_parameters=param_aggregation[t],
-                forward_method = "onepass"
+                forward_method = "twopass",
+                gmm_k = self.K,
             )
             for t in range(len(self.groups))
         }
