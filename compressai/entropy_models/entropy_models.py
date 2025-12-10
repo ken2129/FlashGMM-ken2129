@@ -861,7 +861,8 @@ class GaussianMixtureConditional(GaussianConditional):
             scales.to("cpu"), 
             means.to("cpu"),
             weights.to("cpu"),
-            abs_max + 1
+            abs_max + 1,
+            self.K
         )
 
         return (rv, abs_max, zero_bitmap), y_quantized
@@ -885,7 +886,8 @@ class GaussianMixtureConditional(GaussianConditional):
             scales.to("cpu"),
             means.to("cpu"),
             weights.to("cpu"),
-            abs_max + 1
+            abs_max + 1,
+            self.K
         )
 
         #symbols = torch.tensor(values)

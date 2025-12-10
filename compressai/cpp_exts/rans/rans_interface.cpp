@@ -255,8 +255,9 @@ std::tuple<float, float> _fast_gmm_cdf(
   const std::array<float, K> &weights) {
   float cdf1 = 0.0, cdf2 = 0.0;
 
-  // Check if SIMD path is enabled AND applicable (K==4)
+  // Check if SIMD path is enabled AND applicable (K==3 or K==4)
   if (use_simd_path() && K == 4) {
+    // K=4: Use full 128-bit lanes (4 floats each)
     __m128 x1Simd = _mm_set1_ps(static_cast<float>(x1));
     __m128 x2Simd = _mm_set1_ps(static_cast<float>(x2));
     __m256 x1x2Simd = _mm256_set_m128(x1Simd, x2Simd);
@@ -282,7 +283,35 @@ std::tuple<float, float> _fast_gmm_cdf(
     cdf2Simd_parts = _mm_hadd_ps(cdf2Simd_parts, cdf2Simd_parts);
     cdf2 = _mm_cvtss_f32(cdf2Simd_parts);
 
-  } else { // Generic loop for non-SIMD path or K != 4
+  } else if (use_simd_path() && K == 3) {
+    // K=3: Load 3 values + 1 padding (set weight to 0 for 4th element)
+    __m128 x1Simd = _mm_set1_ps(static_cast<float>(x1));
+    __m128 x2Simd = _mm_set1_ps(static_cast<float>(x2));
+    __m256 x1x2Simd = _mm256_set_m128(x1Simd, x2Simd);
+
+    // Load 3 values and pad with 0 for means/scales, 0 for weights
+    __m128 meansHalf = _mm_set_ps(0.0f, means[2], means[1], means[0]);
+    __m256 meansSimd = _mm256_set_m128(meansHalf, meansHalf);
+    __m128 scalesHalf = _mm_set_ps(1.0f, scales[2], scales[1], scales[0]); // scale=1 to avoid div by 0
+    __m256 scalesSimd = _mm256_set_m128(scalesHalf, scalesHalf);
+    __m128 weightsHalf = _mm_set_ps(0.0f, weights[2], weights[1], weights[0]); // weight=0 so 4th doesn't contribute
+    __m256 weightsSimd = _mm256_set_m128(weightsHalf, weightsHalf);
+
+    __m256 x1x2Normalized = _mm256_div_ps(_mm256_sub_ps(x1x2Simd, meansSimd), scalesSimd);
+    __m256 cdfs = _mm256_mul_ps(weightsSimd, _fast_gaussian_cdf(x1x2Normalized));
+
+    __m128 cdf2Simd_parts = _mm256_castps256_ps128(cdfs);
+    __m128 cdf1Simd_parts = _mm256_extractf128_ps(cdfs, 1);
+    
+    cdf1Simd_parts = _mm_hadd_ps(cdf1Simd_parts, cdf1Simd_parts);
+    cdf1Simd_parts = _mm_hadd_ps(cdf1Simd_parts, cdf1Simd_parts);
+    cdf1 = _mm_cvtss_f32(cdf1Simd_parts);
+
+    cdf2Simd_parts = _mm_hadd_ps(cdf2Simd_parts, cdf2Simd_parts);
+    cdf2Simd_parts = _mm_hadd_ps(cdf2Simd_parts, cdf2Simd_parts);
+    cdf2 = _mm_cvtss_f32(cdf2Simd_parts);
+
+  } else { // Generic loop for non-SIMD path or other K values
     for (int i = 0; i < K; ++i){
       cdf1 += weights[i] * _fast_gaussian_cdf((x1 - means[i])/scales[i]);
       cdf2 += weights[i] * _fast_gaussian_cdf((x2 - means[i])/scales[i]);
@@ -1058,6 +1087,78 @@ torch::Tensor RansDecoder::decode_stream_gmm(
 // K_gmm_default is already defined above
 // constexpr int K = 4; // Replaced by K_gmm_default for pybind context
 
+// Helper functions to dispatch based on runtime K value
+void BufferedRansEncoder_encode_with_indexes_gmm_dispatch(
+    BufferedRansEncoder& self,
+    const torch::Tensor &symbols, const torch::Tensor &scales,
+    const torch::Tensor &means, const torch::Tensor &weights,
+    const int32_t max_value, const int32_t K) {
+    switch(K) {
+        case 1: self.encode_with_indexes_gmm<1>(symbols, scales, means, weights, max_value); break;
+        case 2: self.encode_with_indexes_gmm<2>(symbols, scales, means, weights, max_value); break;
+        case 3: self.encode_with_indexes_gmm<3>(symbols, scales, means, weights, max_value); break;
+        case 4: self.encode_with_indexes_gmm<4>(symbols, scales, means, weights, max_value); break;
+        case 5: self.encode_with_indexes_gmm<5>(symbols, scales, means, weights, max_value); break;
+        case 6: self.encode_with_indexes_gmm<6>(symbols, scales, means, weights, max_value); break;
+        case 7: self.encode_with_indexes_gmm<7>(symbols, scales, means, weights, max_value); break;
+        case 8: self.encode_with_indexes_gmm<8>(symbols, scales, means, weights, max_value); break;
+        default: throw std::runtime_error("Unsupported K value: " + std::to_string(K) + ". K must be 1-8.");
+    }
+}
+
+py::bytes RansEncoder_encode_with_indexes_gmm_dispatch(
+    RansEncoder& self,
+    const torch::Tensor &symbols, const torch::Tensor &scales,
+    const torch::Tensor &means, const torch::Tensor &weights,
+    const int32_t max_value, const int32_t K) {
+    switch(K) {
+        case 1: return self.encode_with_indexes_gmm<1>(symbols, scales, means, weights, max_value);
+        case 2: return self.encode_with_indexes_gmm<2>(symbols, scales, means, weights, max_value);
+        case 3: return self.encode_with_indexes_gmm<3>(symbols, scales, means, weights, max_value);
+        case 4: return self.encode_with_indexes_gmm<4>(symbols, scales, means, weights, max_value);
+        case 5: return self.encode_with_indexes_gmm<5>(symbols, scales, means, weights, max_value);
+        case 6: return self.encode_with_indexes_gmm<6>(symbols, scales, means, weights, max_value);
+        case 7: return self.encode_with_indexes_gmm<7>(symbols, scales, means, weights, max_value);
+        case 8: return self.encode_with_indexes_gmm<8>(symbols, scales, means, weights, max_value);
+        default: throw std::runtime_error("Unsupported K value: " + std::to_string(K) + ". K must be 1-8.");
+    }
+}
+
+torch::Tensor RansDecoder_decode_with_indexes_gmm_dispatch(
+    RansDecoder& self,
+    const std::string &encoded,
+    const torch::Tensor &scales, const torch::Tensor &means,
+    const torch::Tensor &weights, const int32_t max_bs_value, const int32_t K) {
+    switch(K) {
+        case 1: return self.decode_with_indexes_gmm<1>(encoded, scales, means, weights, max_bs_value);
+        case 2: return self.decode_with_indexes_gmm<2>(encoded, scales, means, weights, max_bs_value);
+        case 3: return self.decode_with_indexes_gmm<3>(encoded, scales, means, weights, max_bs_value);
+        case 4: return self.decode_with_indexes_gmm<4>(encoded, scales, means, weights, max_bs_value);
+        case 5: return self.decode_with_indexes_gmm<5>(encoded, scales, means, weights, max_bs_value);
+        case 6: return self.decode_with_indexes_gmm<6>(encoded, scales, means, weights, max_bs_value);
+        case 7: return self.decode_with_indexes_gmm<7>(encoded, scales, means, weights, max_bs_value);
+        case 8: return self.decode_with_indexes_gmm<8>(encoded, scales, means, weights, max_bs_value);
+        default: throw std::runtime_error("Unsupported K value: " + std::to_string(K) + ". K must be 1-8.");
+    }
+}
+
+torch::Tensor RansDecoder_decode_stream_gmm_dispatch(
+    RansDecoder& self,
+    const torch::Tensor &scales, const torch::Tensor &means,
+    const torch::Tensor &weights, const int32_t max_bs_value, const int32_t K) {
+    switch(K) {
+        case 1: return self.decode_stream_gmm<1>(scales, means, weights, max_bs_value);
+        case 2: return self.decode_stream_gmm<2>(scales, means, weights, max_bs_value);
+        case 3: return self.decode_stream_gmm<3>(scales, means, weights, max_bs_value);
+        case 4: return self.decode_stream_gmm<4>(scales, means, weights, max_bs_value);
+        case 5: return self.decode_stream_gmm<5>(scales, means, weights, max_bs_value);
+        case 6: return self.decode_stream_gmm<6>(scales, means, weights, max_bs_value);
+        case 7: return self.decode_stream_gmm<7>(scales, means, weights, max_bs_value);
+        case 8: return self.decode_stream_gmm<8>(scales, means, weights, max_bs_value);
+        default: throw std::runtime_error("Unsupported K value: " + std::to_string(K) + ". K must be 1-8.");
+    }
+}
+
 PYBIND11_MODULE(ans, m) {
   m.attr("__name__") = "compressai.ans";
   m.doc() = "range Asymmetric Numeral System python bindings";
@@ -1075,12 +1176,8 @@ PYBIND11_MODULE(ans, m) {
                const std::vector<int32_t> &, const std::vector<float> &, const int32_t>(
                &BufferedRansEncoder::encode_with_indexes))
       .def("encode_with_indexes_gmm",
-            static_cast<void (BufferedRansEncoder::*) (
-                const torch::Tensor &, const torch::Tensor &, // Changed types
-                const torch::Tensor &, const torch::Tensor &, // Changed types
-                const int32_t)>(
-                &BufferedRansEncoder::encode_with_indexes_gmm<K_gmm_default>), // Use K_gmm_default
-            py::arg("symbols"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_value"))
+            &BufferedRansEncoder_encode_with_indexes_gmm_dispatch,
+            py::arg("symbols"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_value"), py::arg("K") = K_gmm_default)
       .def("flush", &BufferedRansEncoder::flush);
 
   py::class_<RansEncoder>(m, "RansEncoder")
@@ -1096,12 +1193,8 @@ PYBIND11_MODULE(ans, m) {
                const std::vector<int32_t> &, const std::vector<float> &, const int32_t>(
                &RansEncoder::encode_with_indexes))
       .def("encode_with_indexes_gmm",
-            static_cast<py::bytes (RansEncoder::*) (
-                const torch::Tensor &, const torch::Tensor &, // Changed types
-                const torch::Tensor &, const torch::Tensor &, // Changed types
-                const int32_t)>(
-                &RansEncoder::encode_with_indexes_gmm<K_gmm_default>), // Use K_gmm_default
-            py::arg("symbols"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_value"));
+            &RansEncoder_encode_with_indexes_gmm_dispatch,
+            py::arg("symbols"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_value"), py::arg("K") = K_gmm_default);
 
   py::class_<RansDecoder>(m, "RansDecoder")
       .def(py::init<>())
@@ -1124,22 +1217,11 @@ PYBIND11_MODULE(ans, m) {
                &RansDecoder::decode_with_indexes),
            "Decode a string to a list of symbols")
       .def("decode_with_indexes_gmm",
-            static_cast<torch::Tensor (RansDecoder::*) ( // Changed return type
-                              const std::string &, 
-                              const torch::Tensor &, // Changed types
-                              const torch::Tensor &, // Changed types
-                              const torch::Tensor &, // Changed types
-                              const int32_t)>(
-                &RansDecoder::decode_with_indexes_gmm<K_gmm_default>), // Use K_gmm_default
+            &RansDecoder_decode_with_indexes_gmm_dispatch,
             "Decode a string to a tensor of symbols",
-            py::arg("encoded"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"))
+            py::arg("encoded"), py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"), py::arg("K") = K_gmm_default)
       .def("decode_stream_gmm",
-            static_cast<torch::Tensor (RansDecoder::*) (
-                              const torch::Tensor &,
-                              const torch::Tensor &,
-                              const torch::Tensor &,
-                              const int32_t)>(
-                &RansDecoder::decode_stream_gmm<K_gmm_default>),
+            &RansDecoder_decode_stream_gmm_dispatch,
             "Decode stream to a tensor of symbols using GMM",
-            py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"));
+            py::arg("scales"), py::arg("means"), py::arg("weights"), py::arg("max_bs_value"), py::arg("K") = K_gmm_default);
 }
