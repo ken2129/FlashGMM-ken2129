@@ -14,6 +14,23 @@ help: ## Show this message
 	@grep '\s##\s' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' | cat
 
 
+# Install package
+.PHONY: install clean-build
+
+install: ## Install package (use this instead of pip install .)
+	@echo "--> Installing compressai with current PyTorch environment"
+	pip install -e . --no-build-isolation
+	@echo "--> Done!"
+
+clean-build: ## Clean build artifacts and reinstall
+	@echo "--> Cleaning build artifacts"
+	rm -rf build dist *.egg-info
+	find . -name "*.so" -path "./compressai/*" -delete
+	@echo "--> Reinstalling"
+	pip install -e . --no-build-isolation
+	@echo "--> Done!"
+
+
 # Check style and linting
 .PHONY: check-black check-isort check-flake8 check-mypy static-analysis
 
